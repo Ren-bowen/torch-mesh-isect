@@ -45,6 +45,16 @@ import pyrender
 from mesh_intersection.bvh_search_tree import BVH
 
 
+def remove_duplicates(v, f):
+    """
+    Generate a mesh representation with no duplicates and
+    return it along with the mapping to the original mesh layout.
+    """
+
+    unique_verts, inverse = torch.unique(v, dim=0, return_inverse=True)
+    new_faces = inverse[f.long()]
+    return unique_verts, new_faces, inverse
+
 if __name__ == "__main__":
 
     device = torch.device('cuda')

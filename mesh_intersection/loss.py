@@ -121,6 +121,176 @@ def dist_to_cone_axis(points_rel, dot_prod, cone_axis, cone_radius,
 
     return numerator / (denominator + epsilon)
 
+def point_triangle_distance(point: torch.Tensor,
+                            tri: torch.Tensor) -> torch.Tensor:
+    """
+    Compute the shortest Euclidean distance from each point to its
+    corresponding triangle.
+
+    Args
+    ----
+    point : (B, 3) tensor
+        3-D coordinates of the query points.
+    tri   : (B, 3, 3) tensor
+        Triangle vertices ordered as (v0, v1, v2) for each batch item.
+
+    Returns
+    -------
+    dist : (B,) tensor
+        The point-to-triangle distance for every batch element.
+    """
+    EPS = 1e-12 
+
+    # Split triangle vertices for readability
+    v0, v1, v2 = tri[:, :, 0], tri[:, :, 1], tri[:, :, 2]
+
+    # Edge vectors and vector from v0 to the point
+    e0 = v1 - v0                  # edge v0→v1
+    e1 = v2 - v0                  # edge v0→v2
+    w  = point - v0               # v0→p
+
+    # Pre-compute dot products (all shape = (B,))
+    a = (e0 * e0).sum(1).clamp(min=EPS)  # |e0|^2
+    b = (e0 * e1).sum(1)          # e0·e1
+    c = (e1 * e1).sum(1).clamp(min=EPS)  # |e1|^2
+    d = (e0 * w ).sum(1)          # e0·w
+    e = (e1 * w ).sum(1)          # e1·w
+    f = (w  * w ).sum(1)          # |w|^2
+
+    det = a * c - b * b           # 2D parallelogram area squared
+    det = det.clamp(min=EPS)     # numerical safety
+    s   = b * e - c * d           # barycentric test numerator for v1
+    t   = b * d - a * e           # barycentric test numerator for v2
+
+    # Region masks ----------------------------------------------------------
+    in_face = (s >= 0) & (t >= 0) & (s + t <= det)   # inside triangle
+
+    # Edge v0–v1
+    s01 = (d / a).clamp(0, 1)
+    dist2_e01 = (w - s01.unsqueeze(1) * e0).pow(2).sum(1)
+
+    # Edge v0–v2
+    t02 = (e / c).clamp(0, 1)
+    dist2_e02 = (w - t02.unsqueeze(1) * e1).pow(2).sum(1)
+
+    # Edge v1–v2
+    w2  = point - v1
+    e2  = v2 - v1
+    a2  = (e2 * e2).sum(1).clamp(min=EPS)  # |e2|^2
+    d2  = (e2 * w2).sum(1)
+    u12 = (d2 / a2).clamp(0, 1)
+    dist2_e12 = (w2 - u12.unsqueeze(1) * e2).pow(2).sum(1)
+
+    # Interior of the triangle
+    proj = (d * (c) - e * (b))[..., None] * e0 + (e * (a) - d * (b))[..., None] * e1
+    dist2_face = (f * det - (d * s + e * t)) / det
+    dist2_face = dist2_face.clamp(min=0)             # numerical safety
+
+    # Pick distance² from the correct region
+    dist2 = torch.where(in_face, dist2_face,
+                        torch.min(torch.min(dist2_e01, dist2_e02),
+                                  dist2_e12))
+
+    return torch.sqrt(dist2)         # final Euclidean distance (B,)
+
+def edge_edge_distance(p1: torch.Tensor, q1: torch.Tensor,
+                       p2: torch.Tensor, q2: torch.Tensor,
+                       eps: float = 1e-12) -> torch.Tensor:
+    """
+    Compute the minimum Euclidean distance between two 3-D segments
+    for every batch item.
+
+    Args
+    ----
+    p1, p2 : (B, 3) tensor
+        3-D coordinates of the first segment end-points.
+    q1, q2 : (B, 3) tensor
+        3-D coordinates of the second segment end-points.
+    eps  : float
+        Parallel-line threshold.
+
+    Returns
+    -------
+    dist : (B,) tensor
+        Shortest point-to-point distance between the two segments.
+    """
+
+    d1 = q1 - p1                           
+    d2 = q2 - p2                           
+    r  = p1 - p2                           # vector between origins
+
+    a = (d1 * d1).sum(1)                   # squared length of d1
+    e = (d2 * d2).sum(1)                   # squared length of d2
+    f = (d2 * r ).sum(1)
+
+    # Assume segments are not degenerate (length > 0); handle elsewhere if needed
+    b = (d1 * d2).sum(1)
+    c = (d1 * r ).sum(1)
+    denom = a * e - b * b                 # always >= 0
+
+    # Parallel segments: force denominator to 1 to avoid divide-by-0,
+    # we'll correct the result via clamping later.
+    parallel = denom < eps
+    denom_adjusted = torch.where(parallel, torch.ones_like(denom), denom)
+
+    s = (b * f - c * e) / denom_adjusted
+    t = (a * f - b * c) / denom_adjusted
+
+    # For nearly parallel segments use fallback:
+    # project one segment endpoint onto the other segment, set the other
+    # parameter to 0, then clamp.
+    s = torch.where(parallel, torch.zeros_like(s), s)
+
+    # Clamp s, t into [0,1] and recompute the opposite parameter when out of range
+    s_clamped = s.clamp(0.0, 1.0)
+    t_clamped = t.clamp(0.0, 1.0)
+
+    # If clamping occurred on s, recompute t for the new s value
+    recompute_t = (s_clamped != s) | parallel
+    r_new = r + s_clamped.unsqueeze(1) * d1
+    t_new = ((r_new * d2).sum(1) / e).clamp(0.0, 1.0)
+    t_final = torch.where(recompute_t, t_new, t_clamped)
+
+    # If t was clamped (and s not), recompute s for the new t value
+    recompute_s = (t_clamped != t) & ~parallel & (s_clamped == s)
+    r_new2 = r - t_final.unsqueeze(1) * d2
+    s_new = ((-r_new2) * d1).sum(1) / a
+    s_final = torch.where(recompute_s, s_new.clamp(0.0, 1.0), s_clamped)
+
+    # Closest points on each segment
+    c1 = p1 + s_final.unsqueeze(1) * d1
+    c2 = p2 + t_final.unsqueeze(1) * d2
+
+    # Return Euclidean distance
+    return (c1 - c2).norm(dim=1)
+
+
+def triangle_distance(triangle_points, other_triangle_points):
+    ''' Computes the distance between two triangles
+
+        Args:
+            - triangle_points (torch.tensor Nx3x3): The coordinates of the
+              points of the triangles of pair I
+            - other_triangle_points (torch.tensor Nx3x3): The coordinates of
+              the points of the triangles of pair II
+        Returns:
+            - (torch.tensor N): The distance between the triangles
+    '''
+    min_dist = torch.full((triangle_points.shape[0],),
+                          float('inf'), dtype=triangle_points.dtype,
+                          device=triangle_points.device)
+    for i in range(3):
+        min_dist = torch.min(min_dist, point_triangle_distance(triangle_points[:, i],
+                                                               other_triangle_points))
+        min_dist = torch.min(min_dist, point_triangle_distance(other_triangle_points[:, i],
+                                                               triangle_points))
+    for i in range(3):
+        for j in range(3):
+            min_dist = torch.min(min_dist, edge_edge_distance(triangle_points[:, i],
+                                                                triangle_points[:, (i + 1) % 3],
+                                                                other_triangle_points[:, j],
+                                                                other_triangle_points[:, (j + 1) % 3]))
+    return min_dist
 
 def conical_distance_field(triangle_points, cone_center, cone_radius,
                            cone_axis, sigma=0.5, vectorized=True,
@@ -208,30 +378,30 @@ class DistanceFieldPenetrationLoss(nn.Module):
         self.penalize_outside = penalize_outside
         self.linear_max = linear_max
 
-    def forward(self, triangles, collision_idxs):
+    def forward(self, triangles, close_idxs):
         '''
         Args:
             - triangles: A torch tensor of size BxFx3x3 that contains the
                 coordinates of the triangle vertices
-            - collision_idxs: A torch tensor of size Bx(-1)x2 that contains the
-              indices of the colliding pairs
+            - close_idxs: A torch tensor of size Bx(-1)x2 that contains the
+              indices of the close pairs
         Returns:
             A tensor with size B that contains the self penetration loss for
             each mesh in the batch
         '''
 
-        coll_idxs = collision_idxs[:, :, 0].ge(0).nonzero()
-        if len(coll_idxs) < 1:
+        clo_idxs = close_idxs[:, :, 0].ge(0).nonzero()
+        if len(clo_idxs) < 1:
             return torch.zeros([triangles.shape[0]],
                                dtype=triangles.dtype,
                                device=triangles.device,
                                requires_grad=triangles.requires_grad)
 
-        receiver_faces = collision_idxs[coll_idxs[:, 0], coll_idxs[:, 1], 0]
-        intruder_faces = collision_idxs[coll_idxs[:, 0], coll_idxs[:, 1], 1]
+        receiver_faces = close_idxs[clo_idxs[:, 0], clo_idxs[:, 1], 0]
+        intruder_faces = close_idxs[clo_idxs[:, 0], clo_idxs[:, 1], 1]
 
-        batch_idxs = coll_idxs[:, 0]
-        num_collisions = coll_idxs.shape[0]
+        batch_idxs = clo_idxs[:, 0]
+        num_closes = clo_idxs.shape[0]
 
         batch_size = triangles.shape[0]
 
@@ -243,75 +413,14 @@ class DistanceFieldPenetrationLoss(nn.Module):
         # Size: BxFx3
         edge0 = triangles[:, :, 1] - triangles[:, :, 0]
         edge1 = triangles[:, :, 2] - triangles[:, :, 0]
-        # Compute the cross product of the edges to find the normal vector of
-        # the triangle
-        aCrossb = torch.cross(edge0, edge1, dim=2)
-
-        circumradius, circumcenter = calc_circumcircle(triangles, aCrossb)
-
-        # Normalize the result to get a unit vector
-        normals = aCrossb / torch.norm(aCrossb, 2, dim=2, keepdim=True)
 
         recv_triangles = triangles[batch_idxs, receiver_faces]
         intr_triangles = triangles[batch_idxs, intruder_faces]
-        
-        recv_normals = normals[batch_idxs, receiver_faces]
-        recv_circumradius = circumradius[batch_idxs, receiver_faces]
-        recv_circumcenter = circumcenter[batch_idxs, receiver_faces]
 
-        intr_normals = normals[batch_idxs, intruder_faces]
-        intr_circumradius = circumradius[batch_idxs, intruder_faces]
-        intr_circumcenter = circumcenter[batch_idxs, intruder_faces]
+        distace = triangle_distance(recv_triangles, intr_triangles)
+        eps = 1e-3
+        loss = torch.max(eps - distace, torch.tensor(0.0,
+                                                      device=triangles.device,
+                                                      dtype=triangles.dtype)).mean()
 
-        # Compute the distance field for the intruding triangles
-        # B x NUM_COLLISIONS x 3
-        # For each batch element, for each collision pair, 3 distance values
-        # for the vertices of the intruding triangle
-        phi_receivers = conical_distance_field(
-            intr_triangles,
-            recv_circumcenter, recv_circumradius,
-            recv_normals,
-            sigma=self.sigma,
-            vectorized=self.vectorized,
-            penalize_outside=self.penalize_outside,
-            linear_max=self.linear_max)
-
-        # Compute the distance field for the intruding triangles
-        # B x NUM_COLLISIONS x 3
-        # For each batch element, for each collision pair, 3 distance values
-        # for the vertices of the intruding triangle
-        # Same as above, but now the receiver is the "intruder".
-        phi_intruders = conical_distance_field(
-            recv_triangles,
-            intr_circumcenter,
-            intr_circumradius,
-            intr_normals,
-            sigma=self.sigma,
-            vectorized=self.vectorized,
-            penalize_outside=self.penalize_outside,
-            linear_max=self.linear_max)
-
-        receiver_loss = torch.tensor(0, device=triangles.device,
-                                     dtype=torch.float32)
-        intruder_loss = torch.tensor(0, device=triangles.device,
-                                     dtype=torch.float32)
-
-        if self.point2plane:
-            receiver_loss = (-phi_receivers).pow(2).sum(dim=-1)
-            intruder_loss = (-phi_intruders).pow(2).sum(dim=-1)
-        else:
-            receiver_loss = torch.norm(-phi_receivers.unsqueeze(dim=-1) *
-                                       intr_normals.unsqueeze(dim=-2), p=2,
-                                       dim=-1).pow(2).sum(dim=-1)
-            intruder_loss = torch.norm(-phi_intruders.unsqueeze(dim=-1) *
-                                       recv_normals.unsqueeze(dim=-2), p=2,
-                                       dim=-1).pow(2).sum(dim=-1)
-
-        batch_ind = torch.arange(0, batch_size, dtype=batch_idxs.dtype,
-                                 device=triangles.device).unsqueeze(dim=1)
-        batch_mask = batch_ind.repeat([1, num_collisions]).eq(batch_idxs)\
-            .to(receiver_loss.dtype)
-
-        loss = torch.matmul(batch_mask, receiver_loss) + \
-            torch.matmul(batch_mask, intruder_loss)
         return loss

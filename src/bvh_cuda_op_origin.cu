@@ -35,8 +35,7 @@
 #include <type_traits>
 
 #include "double_vec_ops.h"
-#include "helper_math.h"
-// #include "/home/renbowen/cuda-samples-12.4/Common/helper_math.h"
+#include "/home/renbowen/cuda-samples-12.4/Common/helper_math.h"
 
 // Size of the stack used to traverse the Bounding Volume Hierarchy tree
 #ifndef STACK_SIZE
@@ -85,64 +84,11 @@
 #define cudaCheckError()
 #endif
 
-// #define DEBUG_PRINT 1
-
 typedef unsigned int MortonCode;
 
-// template <typename T>
-// using vec3 = typename std::conditional<std::is_same<T, float>::value, float3,
-//                                        double3>::type;
 template <typename T>
-struct vec3 {
-  T x, y, z;
-
-  __host__ __device__ vec3() : x(0), y(0), z(0) {}
-  __host__ __device__ vec3(T x, T y, T z) : x(x), y(y), z(z) {}
-
-  __host__ __device__ vec3<T> operator+(const vec3<T>& v) const {
-    return vec3<T>(x + v.x, y + v.y, z + v.z);
-  }
-
-  __host__ __device__ vec3<T> operator*(T s) const {
-    return vec3<T>(x * s, y * s, z * s);
-  }
-
-  __host__ __device__ vec3<T> operator-(const vec3<T>& v) const {
-    return vec3<T>(x - v.x, y - v.y, z - v.z);
-  }
-
-  __host__ __device__ vec3<T> operator/(T s) const {
-    return vec3<T>(x / s, y / s, z / s);
-  }
-
-  // ... 
-};
-
-template <typename T>
-__host__ __device__ inline vec3<T> operator*(T s, const vec3<T>& v) {
-    return vec3<T>(v.x * s, v.y * s, v.z * s);
-}
-
-template <typename T>
-__host__ __device__ inline vec3<T> cross(const vec3<T>& a, const vec3<T>& b) {
-    return vec3<T>(
-        a.y * b.z - a.z * b.y,
-        a.z * b.x - a.x * b.z,
-        a.x * b.y - a.y * b.x
-    );
-}
-
-template <typename T>
-__host__ __device__ __forceinline__
-T dot(const vec3<T>& a, const vec3<T>& b) {
-    return a.x * b.x + a.y * b.y + a.z * b.z;
-}
-
-template <typename T>
-__host__ __device__ __forceinline__
-T vec_length(const vec3<T>& v) {
-    return sqrt(dot(v, v));
-}
+using vec3 = typename std::conditional<std::is_same<T, float>::value, float3,
+                                       double3>::type;
 
 template <typename T>
 using vec2 = typename std::conditional<std::is_same<T, float>::value, float2,
@@ -274,14 +220,10 @@ public:
                                const vec3<T> &vertex2)
       : v0(vertex0), v1(vertex1), v2(vertex2){};
 
-  __host__ __device__ AABB<T> ComputeBBoxWithMargin(T margin = 5e-4) {
-    return AABB<T>(
-        min(v0.x, min(v1.x, v2.x)) - margin,
-        min(v0.y, min(v1.y, v2.y)) - margin,
-        min(v0.z, min(v1.z, v2.z)) - margin,
-        max(v0.x, max(v1.x, v2.x)) + margin,
-        max(v0.y, max(v1.y, v2.y)) + margin,
-        max(v0.z, max(v1.z, v2.z)) + margin);
+  __host__ __device__ AABB<T> ComputeBBox() {
+    return AABB<T>(min(v0.x, min(v1.x, v2.x)), min(v0.y, min(v1.y, v2.y)),
+                   min(v0.z, min(v1.z, v2.z)), max(v0.x, max(v1.x, v2.x)),
+                   max(v0.y, max(v1.y, v2.y)), max(v0.z, max(v1.z, v2.z)));
   }
 };
 
@@ -300,7 +242,7 @@ __global__ void ComputeTriBoundingBoxes(Triangle<T> *triangles,
                                         int num_triangles, AABB<T> *bboxes) {
   int idx = threadIdx.x + blockDim.x * blockIdx.x;
   if (idx < num_triangles) {
-    bboxes[idx] = triangles[idx].ComputeBBoxWithMargin();
+    bboxes[idx] = triangles[idx].ComputeBBox();
   }
 }
 
@@ -389,163 +331,6 @@ __device__ bool TriangleTriangleIsectSepAxis(const Triangle<T> &tri1,
   return isect_flag;
 }
 
-template <typename T>
-__device__ __forceinline__ 
-T PointTriangleDistance(const vec3<T>& p, const Triangle<T>& tri) {
-  const vec3<T>  a = tri.v0;
-  const vec3<T>  b = tri.v1;
-  const vec3<T>  c = tri.v2;
-
-  // Edge vectors
-  vec3<T> ab = b - a;
-  vec3<T> ac = c - a;
-  vec3<T> ap = p - a;
-
-  // Compute barycentric coordinates (u, v, w), and project to nearest point accordingly
-  T d1 = dot(ab, ap);
-  T d2 = dot(ac, ap);
-  if (d1 <= 0 && d2 <= 0) return vec_length<T>(ap);          // Closest to vertex a
-
-  vec3<T> bp = p - b;
-  T d3 = dot(ab, bp);
-  T d4 = dot(ac, bp);
-  if (d3 >= 0 && d4 <= d3) return vec_length<T>(bp);         // Closest to vertex b
-
-  T vc = d1*d4 - d3*d2;
-  if (vc <= 0 && d1 >= 0 && d3 <= 0) {                // Closest to edge AB
-      T v = d1 / (d1 - d3);
-      return vec_length<T>(ap - v * ab);
-  }
-
-  vec3<T> cp = p - c;
-  T d5 = dot(ab, cp);
-  T d6 = dot(ac, cp);
-  if (d6 >= 0 && d5 <= d6) return vec_length<T>(cp);         // Closest to vertex c
-
-  T vb = d5*d2 - d1*d6;
-  if (vb <= 0 && d2 >= 0 && d6 <= 0) {                // Closest to edge AC
-      T w = d2 / (d2 - d6);
-      return vec_length<T>(ap - w * ac);
-  }
-
-  T va = d3*d6 - d5*d4;
-  if (va <= 0 && (d4-d3) >= 0 && (d5-d6) >= 0) {      // Closest to edge BC
-      vec3<T> bc = c - b;
-      T w = (d4 - d3) / ((d4 - d3) + (d5 - d6));
-      return vec_length<T>(bp - w * bc);
-  }
-
-  // Projection lies inside the triangle
-  vec3<T> n = cross(ab, ac);
-  return fabs(dot(ap, n)) / vec_length<T>(n);
-}
-
-template <typename T>
-__device__ __forceinline__
-T EdgeEdgeDistance(const vec3<T>& P0, const vec3<T>& P1,
-                   const vec3<T>& Q0, const vec3<T>& Q1) {
-
-  // Direction vectors of the two segments
-  vec3<T> u = P1 - P0;
-  vec3<T> v = Q1 - Q0;
-  vec3<T> w0 = P0 - Q0;          // Vector between segment origins
-
-  // suppose P_proj = P0 + sc * u
-  //         Q_proj = Q0 + tc * v;
-
-  // Scalar products needed for the analytic solution
-  T a = dot(u, u);               // u·u
-  T b = dot(u, v);               // u·v
-  T c = dot(v, v);               // v·v
-  T d = dot(u, w0);              // u·w0
-  T e = dot(v, w0);              // v·w0
-  T D = a * c - b * b;           // Denominator (always ≥ 0)
-
-  // Parameters on each segment, in [0,1] after clamping
-  T sN, sD = D;                  // sc = sN / sD
-  T tN, tD = D;                  // tc = tN / tD
-
-  const T EPS = (T)1e-8;         // Parallelism threshold
-
-  // --- compute the line parameters of the two closest points --- //
-  if (D < EPS) {                 // Segments almost parallel
-      sN = 0.0;
-      sD = 1.0;                  // force using P0 on segment P
-      tN = e;
-      tD = c;
-  } else {
-      sN = (b * e - c * d);
-      tN = (a * e - b * d);
-
-      // Clamp sc to [0,1]
-      if (sN < 0.0) {            // sc < 0 => clamp to 0
-          sN = 0.0;
-          tN = e;
-          tD = c;
-      } else if (sN > sD) {      // sc > 1 => clamp to 1
-          sN = sD;
-          tN = e + b;
-          tD = c;
-      }
-  }
-
-  // Clamp tc to [0,1] (using updated sc)
-  if (tN < 0.0) {                // tc < 0 => clamp to 0
-      tN = 0.0;
-
-      // Re‑compute sc for this tc
-      if (-d < 0.0)
-          sN = 0.0;
-      else if (-d > a)
-          sN = sD;
-      else {
-          sN = -d;
-          sD = a;
-      }
-  } else if (tN > tD) {          // tc > 1 => clamp to 1
-      tN = tD;
-
-      // Re‑compute sc for this tc
-      if (-d + b < 0.0)
-          sN = 0.0;
-      else if (-d + b > a)
-          sN = sD;
-      else {
-          sN = (-d + b);
-          sD = a;
-      }
-  }
-
-  // --- finally, compute the closest points and the distance --- //
-  T sc = (fabs(sN) < EPS ? 0.0 : sN / sD);
-  T tc = (fabs(tN) < EPS ? 0.0 : tN / tD);
-
-  vec3<T> dP = w0 + sc * u - tc * v;   // Vector between closest points
-  return vec_length<T>(dP);                   // Euclidean distance
-}
-
-template <typename T>
-__device__ T TriangleTriangleDistance(const Triangle<T>& t1, const Triangle<T>& t2) {
-  // 计算6条边到对方三角形的距离，取最小值即可
-  T min_dist = FLT_MAX;
-  min_dist = min(min_dist, PointTriangleDistance<T>(t1.v0, t2));
-  min_dist = min(min_dist, PointTriangleDistance<T>(t1.v1, t2));
-  min_dist = min(min_dist, PointTriangleDistance<T>(t1.v2, t2));
-  min_dist = min(min_dist, PointTriangleDistance<T>(t2.v0, t1));
-  min_dist = min(min_dist, PointTriangleDistance<T>(t2.v1, t1));
-  min_dist = min(min_dist, PointTriangleDistance<T>(t2.v2, t1));
-  min_dist = min(min_dist, EdgeEdgeDistance<T>(t1.v0, t1.v1, t2.v0, t2.v1));
-  min_dist = min(min_dist, EdgeEdgeDistance<T>(t1.v0, t1.v1, t2.v1, t2.v2));
-  min_dist = min(min_dist, EdgeEdgeDistance<T>(t1.v0, t1.v1, t2.v2, t2.v0));
-  min_dist = min(min_dist, EdgeEdgeDistance<T>(t1.v0, t1.v2, t2.v0, t2.v1));
-  min_dist = min(min_dist, EdgeEdgeDistance<T>(t1.v0, t1.v2, t2.v1, t2.v2));
-  min_dist = min(min_dist, EdgeEdgeDistance<T>(t1.v0, t1.v2, t2.v2, t2.v0));
-  min_dist = min(min_dist, EdgeEdgeDistance<T>(t1.v1, t1.v2, t2.v0, t2.v1));
-  min_dist = min(min_dist, EdgeEdgeDistance<T>(t1.v1, t1.v2, t2.v1, t2.v2));
-  min_dist = min(min_dist, EdgeEdgeDistance<T>(t1.v1, t1.v2, t2.v2, t2.v0));
-  return min_dist;
-}
-
 // Returns true if the triangles share one or multiple vertices
 template <typename T>
 __device__
@@ -578,10 +363,9 @@ __global__ void checkTriangleIntersections(long2 *collisions,
 
     Triangle<T> tri1 = triangles[first_tri_idx];
     Triangle<T> tri2 = triangles[second_tri_idx];
-    T DIST_THRESHOLD = 1e-3;
-    bool do_close = TriangleTriangleDistance<T>(tri1, tri2) < DIST_THRESHOLD &&
+    bool do_collide = TriangleTriangleIsectSepAxis<T>(tri1, tri2) &&
                       !shareVertex<T>(tri1, tri2);
-    if (do_close) {
+    if (do_collide) {
       collisions[idx] = make_long2(first_tri_idx, second_tri_idx);
     } else {
       collisions[idx] = make_long2(-1, -1);
@@ -721,30 +505,6 @@ __global__ void findPotentialCollisions(long2 *collisionIndices,
   return;
 }
 
-template <typename T>
-__global__ void countPotentialCollisions(   // ❶ 计数 kernel
-        BVHNodePtr<T>  root,
-        BVHNodePtr<T>  leaves,
-        int*           triangle_ids,
-        int            num_primitives,
-        int*           perTriCounter )      // 每个三角形自己的计数槽
-{
-    int idx = threadIdx.x + blockDim.x * blockIdx.x;
-    if (idx >= num_primitives) return;
-
-    BVHNodePtr<T> leaf  = leaves + idx;
-    int tri_id          = triangle_ids[idx];
-
-    /* traverseBVH 里不再写数组，只返回碰撞数 */
-    int local_cnt = traverseBVH<T>(
-                       /* collisionIndices = */ nullptr,
-                       root, leaf->bbox, tri_id, leaf,
-                       /* max_collisions  = */ INT_MAX,
-                       /* counter         = */ nullptr);
-
-    perTriCounter[idx] = local_cnt;     // 写回本三角形的真实邻居数
-}
-
 // Expands a 10-bit integer into 30 bits
 // by inserting 2 zeros after each bit.
 __device__
@@ -848,7 +608,7 @@ __global__ void BuildRadixTree(MortonCode *morton_codes, int num_triangles,
   int delta_min = LongestCommonPrefix(idx, idx - direction, morton_codes,
                                       num_triangles, triangle_ids);
 
-  // Do binary search to compute the upper bound for the vec_length of the range
+  // Do binary search to compute the upper bound for the length of the range
   int lmax = 2;
   while (LongestCommonPrefix(idx, idx + lmax * direction, morton_codes,
                              num_triangles, triangle_ids) > delta_min) {
@@ -867,7 +627,7 @@ __global__ void BuildRadixTree(MortonCode *morton_codes, int num_triangles,
   }
   int j = idx + l * direction;
 
-  // Find the vec_length of the longest common prefix for the current node
+  // Find the length of the longest common prefix for the current node
   int node_delta =
       LongestCommonPrefix(idx, j, morton_codes, num_triangles, triangle_ids);
   int s = 0;
@@ -916,7 +676,7 @@ __global__ void CreateHierarchy(BVHNodePtr<T> internal_nodes,
 
   Triangle<T> tri = triangles[triangle_ids[idx]];
   // Assign the bounding box of the triangle to the leaves
-  leaf->bbox = tri.ComputeBBoxWithMargin();
+  leaf->bbox = tri.ComputeBBox();
   leaf->rightmost = leaf;
 
   BVHNodePtr<T> curr_node = leaf->parent;
@@ -1183,7 +943,7 @@ void bvh_cuda_forward(at::Tensor triangles, at::Tensor *collision_tensor_ptr,
 
   // Construct the bvh tree
   AT_DISPATCH_FLOATING_TYPES(
-      triangles.scalar_type(), "bvh_tree_building", ([&] {
+    triangles.scalar_type(), "bvh_tree_building", ([&] {
         thrust::device_vector<BVHNode<scalar_t>> leaf_nodes(num_triangles);
         thrust::device_vector<BVHNode<scalar_t>> internal_nodes(num_triangles -
                                                                 1);
